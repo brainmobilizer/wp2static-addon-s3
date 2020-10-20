@@ -22,6 +22,8 @@ class Deployer {
     public function __construct() {}
 
     public function uploadFiles( string $processed_site_path ) : void {
+        \WP2Static\WsLog::l( 'S3 Addon uploading files' );
+
         // check if dir exists
         if ( ! is_dir( $processed_site_path ) ) {
             return;
@@ -31,6 +33,18 @@ class Deployer {
 
         // instantiate S3 client
         $s3 = self::s3Client();
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - s3Client created' );
+
+        //Listing all S3 Bucket
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - try retrieving S3 buckets' );
+        try {
+          $buckets = $s3->listBuckets();
+          foreach ($buckets['Buckets'] as $bucket) {
+            \WP2Static\WsLog::l( 'S3 Addon uploadFiles - S3 bucket: ' . $bucket['Name'] );
+          }
+        } catch (AwsException $e) {
+          \WP2Static\WsLog::l( 'S3 Addon uploadFiles - S3 Error: ' . $e->getAwsErrorMessage() );
+        }
 
         // iterate each file in ProcessedSite
         $iterator = new RecursiveIteratorIterator(
@@ -41,10 +55,16 @@ class Deployer {
         );
 
         $object_acl = Controller::getValue( 's3ObjectACL' );
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - s3ObjectACL retrieved' );
+        if ($object_acl === '') {
+            \WP2Static\WsLog::l( 'S3 Addon uploadFiles - ACL: public read' );
+        }
+
         $put_data = [
             'Bucket' => Controller::getValue( 's3Bucket' ),
             'ACL'    => $object_acl === '' ? 'public-read' : $object_acl,
         ];
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - S3 bucket: ' . $put_data['Bucket'] );
 
         $cache_control = Controller::getValue( 's3CacheControl' );
         if ( $cache_control ) {
@@ -57,9 +77,13 @@ class Deployer {
         $cf_max_paths = $cf_max_paths ? intval( $cf_max_paths ) : 0;
         $cf_stale_paths = [];
 
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - processed site path: ' . $processed_site_path);
+        \WP2Static\WsLog::l( 'S3 Addon uploadFiles - start uploading...');
+
         foreach ( $iterator as $filename => $file_object ) {
             $base_name = basename( $filename );
             if ( $base_name != '.' && $base_name != '..' ) {
+                \WP2Static\WsLog::l( 'S3 Addon uploadFiles - uploading '. $filename );
                 $real_filepath = realpath( $filename );
 
                 // TODO: do filepaths differ when running from WP-CLI (non-chroot)?
@@ -85,10 +109,13 @@ class Deployer {
                     ltrim( $cache_key, '/' ) :
                     ltrim( $cache_key, '/' );
 
+                \WP2Static\WsLog::l( 'S3 Addon uploadFiles - s3 key: ' . $s3_key );
+
                 $mime_type = MimeTypes::guessMimeType( $filename );
                 if ( 'text/' === substr( $mime_type, 0, 5 ) ) {
                     $mime_type = $mime_type . '; charset=UTF-8';
                 }
+                \WP2Static\WsLog::l( 'S3 Addon uploadFiles - mime type: ' . $mime_type );
 
                 $put_data['Key'] = $s3_key;
                 $put_data['ContentType'] = $mime_type;
@@ -97,29 +124,43 @@ class Deployer {
                 $body_hash = md5( (string) $put_data['Body'] );
                 $hash = md5( $put_data_hash . $body_hash );
 
-                $is_cached = \WP2Static\DeployCache::fileisCached(
-                    $cache_key,
-                    $namespace,
-                    $hash,
-                );
+                \WP2Static\WsLog::l( 'S3 Addon uploadFiles - hash: ' . $hash );
+                try {
+                  $is_cached = \WP2Static\DeployCache::fileisCached(
+                      $cache_key,
+                      $namespace,
+                      $hash);
 
-                if ( $is_cached ) {
+                  if ( $is_cached ) {
+                    \WP2Static\WsLog::l( 'S3 Addon uploadFiles - cached: ' . $filename );
                     continue;
+                  } else {
+                    \WP2Static\WsLog::l( 'S3 Addon uploadFiles - not cached: ' . $filename );
+                  }
+                } catch (Exception $e) {
+                  \WP2Static\WsLog::l( 'S3 Addon uploadFiles - fileisCached error: ' . $e->getMessage());
                 }
 
-                $result = $s3->putObject( $put_data );
+                try {
+                  $result = $s3->putObject( $put_data );
 
-                if ( $result['@metadata']['statusCode'] === 200 ) {
-                    \WP2Static\DeployCache::addFile( $cache_key, $namespace, $hash );
+                  if ( $result['@metadata']['statusCode'] === 200 ) {
+                      \WP2Static\WsLog::l( 'S3 Addon uploadFiles - uploading successful: ' . $filename);
+                      \WP2Static\DeployCache::addFile( $cache_key, $namespace, $hash );
 
-                    if ( $cf_max_paths >= count( $cf_stale_paths ) ) {
-                        $cf_key = $cache_key;
-                        if ( 0 === substr_compare( $cf_key, '/index.html', -11 ) ) {
-                            $cf_key = substr( $cf_key, 0, -10 );
-                        }
-                        $cf_key = str_replace( ' ', '%20', $cf_key );
-                        array_push( $cf_stale_paths, $cf_key );
-                    }
+                      if ( $cf_max_paths >= count( $cf_stale_paths ) ) {
+                          $cf_key = $cache_key;
+                          if ( 0 === substr_compare( $cf_key, '/index.html', -11 ) ) {
+                              $cf_key = substr( $cf_key, 0, -10 );
+                          }
+                          $cf_key = str_replace( ' ', '%20', $cf_key );
+                          array_push( $cf_stale_paths, $cf_key );
+                      }
+                  } else {
+                    \WP2Static\WsLog::l( 'S3 Addon uploadFiles - uploading failed: ' . $filename);
+                  }
+                } catch (Exception $e) {
+                  \WP2Static\WsLog::l( 'S3 Addon uploadFiles - uploading error: ' . $e->getMessage());
                 }
             }
         }
@@ -149,8 +190,7 @@ class Deployer {
             $is_cached = \WP2Static\DeployCache::fileisCached(
                 $cache_key,
                 $namespace,
-                $hash,
-            );
+                $hash);
 
             if ( $is_cached ) {
                 continue;
@@ -214,6 +254,11 @@ class Deployer {
         } elseif ( Controller::getValue( 's3Profile' ) ) {
             $client_options['profile'] = Controller::getValue( 's3Profile' );
         }
+
+        \WP2Static\WsLog::l( 'S3 Client options - version: ' . $client_options['version']);
+        \WP2Static\WsLog::l( 'S3 Client options - region: ' . $client_options['region']);
+        \WP2Static\WsLog::l( 'S3 Client options - key: ' . $client_options['credentials']['key']);
+        \WP2Static\WsLog::l( 'S3 Client options - secret: ' . $client_options['credentials']['secret']);
 
         return new \Aws\S3\S3Client( $client_options );
     }
